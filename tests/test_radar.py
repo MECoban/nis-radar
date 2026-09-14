@@ -490,6 +490,12 @@ class ReportFileAndSiteTests(RadarCase):
         self.assertIn("4 yeni içerik, 4 özet</p>", html)
         self.assertNotIn("çalışma", html)
 
+    def test_table_cell_with_escaped_pipe(self):
+        """Kanal adindaki '|' raporda '\\|' olarak kacislidir; HTML tabloda tek hucre kalmali."""
+        html = radar.md_to_html("| Kanal | Video | Durum |\n|---|---|---|\n| Nate Herk \\| AI Automation | Baslik | altyazi |\n")
+        self.assertEqual(html.count("<td>"), 3)
+        self.assertIn("<td>Nate Herk | AI Automation</td>", html)
+
     def test_render_day_splits_on_header_not_hr(self):
         run1 = "%s2026-09-14\n\n**1 yeni içerik**, 1 özet. Üretim: x\n\n## Videolar\n\n### [A](https://youtu.be/a)\n\nözet\n\n---\n\nsatır\n\n## Durum tablosu\n\n| Kanal | Video | Durum |\n|---|---|---|\n| K | A | altyazi |\n" % radar.REPORT_MARK
         run2 = run1.replace("[A]", "[B]")
