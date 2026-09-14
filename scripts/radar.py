@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 from pathlib import Path
@@ -49,6 +50,7 @@ STATE = HOME / "state.json"
 REPORTS = HOME / "reports"
 LOGS = HOME / "logs"
 CACHE = HOME / "cache"
+LOCK = HOME / "run.lock"
 SCRIPT_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
@@ -65,6 +67,7 @@ DEFAULT_CONFIG = {
     "max_age_days": 14,
     "max_attempts": 3,
     "max_consecutive_failures": 5,
+    "lock_stale_hours": 3,
     "sub_langs": ["en", "tr"],
     "summary_lang": "Türkçe",
     "model": "sonnet",
@@ -528,6 +531,14 @@ def make_digest(cfg: dict, blocks: list) -> str:
 
 # ----------------------------------------------------------------- bildirim
 def notify(cfg: dict, title: str, body: str) -> None:
+    """Bildirim asla calismayi dusurmez: osascript/Telegram hatasi sadece loglanir."""
+    try:
+        _notify_impl(cfg, title, body)
+    except Exception as e:  # noqa: BLE001
+        log("  ! bildirim gonderilemedi: %s" % e)
+
+
+def _notify_impl(cfg: dict, title: str, body: str) -> None:
     if IS_MAC and cfg.get("notify_macos"):
         safe = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')  # noqa: E731
         run(["osascript", "-e", 'display notification "%s" with title "%s"' % (safe(body[:200]), safe(title))], timeout=15)
@@ -664,6 +675,12 @@ def cmd_doctor(args) -> None:
     state_d = load_json(STATE, {})
     if state_d.get("backlog"):
         print("  bekleyen :", len(state_d["backlog"]), "icerik (sonraki calismada islenir)")
+    if state_d.get("pending"):
+        print("  bekleyen ozet:", len(state_d["pending"]), "(rapor yazilamamisti; sonraki calismada rapora girer)")
+    err = state_d.get("last_error") or {}
+    print("  son hata :", "%s — %s" % (err.get("t"), err.get("msg")) if err else "yok")
+    if LOCK.exists():
+        print("  kilit    : VAR (%s) — calisma suruyor ya da bayat; bayatsa sonraki run kendisi siler" % LOCK)
     if cfg["channels"] and which("yt-dlp"):
         ch = cfg["channels"][0]
         t0 = time.time()
@@ -706,6 +723,9 @@ def load_state(cfg: dict) -> dict:
     s["backlog"] = backlog
     s.setdefault("pending", [])
     s.setdefault("last_error", None)
+    if "baselined" not in s:
+        # eski surum: kanal bazli baslangic noktasi yoktu; initialized ise mevcut kanallar baslatilmis sayilir
+        s["baselined"] = {c["id"]: s.get("last_run") or now() for c in cfg["channels"]} if s["initialized"] else {}
     return s
 
 
@@ -727,8 +747,94 @@ def check_report_dir_writable(rdir: Path) -> None:
                          "launchd icin klasor izni / Tam Disk Erisimi gerekebilir." % (rdir, e))
 
 
+def acquire_lock(cfg: dict) -> bool:
+    """HOME/run.lock: zamanlayici + elle calistirma ust uste binmesin. Bayat kilit (olu pid / eski) silinir."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    stale_after = float(cfg.get("lock_stale_hours") or 3) * 3600
+    for _ in (1, 2):
+        try:
+            fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            info: dict = {}
+            try:
+                data = json.loads(LOCK.read_text(encoding="utf-8") or "{}")
+                info = data if isinstance(data, dict) else {}
+            except (OSError, ValueError):
+                pass
+            try:
+                age = time.time() - LOCK.stat().st_mtime
+            except OSError:
+                continue  # kilit bu arada silindi, tekrar dene
+            stale = age > stale_after
+            pid = info.get("pid")
+            if not IS_WIN and pid:
+                # os.kill(pid, 0) yalnizca POSIX'te "yasiyor mu" sorusudur; Windows'ta sureci OLDURUR, o yuzden atlanir
+                try:
+                    os.kill(int(pid), 0)
+                except ProcessLookupError:
+                    stale = True
+                except (PermissionError, ValueError, OverflowError):
+                    pass
+            if not stale:
+                log("baska bir calisma devam ediyor (pid %s, %s); cikiliyor" % (pid, info.get("t", "?")))
+                return False
+            log("eski kilit siliniyor (pid %s, %.0f dk once)" % (pid, age / 60))
+            LOCK.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "t": now()}, f)
+        log("kilit alindi: %s" % LOCK.name)
+        return True
+    log("kilit alinamadi; cikiliyor")
+    return False
+
+
+def release_lock() -> None:
+    LOCK.unlink(missing_ok=True)
+
+
+def set_last_error(msg: str | None) -> None:
+    """state.json'u DISKTEN yeniden yukleyip sadece last_error'u yazar (yarim kalmis bellek state'i yazilmaz)."""
+    try:
+        s = load_json(STATE, {}) if STATE.exists() else None
+        if s is None:
+            if msg is None:
+                return
+            s = {}
+        if s.get("last_error") is None and msg is None:
+            return
+        s["last_error"] = {"t": now(), "msg": msg[:500]} if msg else None
+        save_json(STATE, s)
+    except (OSError, SystemExit) as e:
+        log("  ! last_error yazilamadi: %s" % e)
+
+
 def cmd_run(args) -> None:
+    """Kilit + hata yakalama sarmalayicisi; asil is _run'da. Sessiz basarisizlik yok: her hata loglanir ve bildirilir."""
     cfg = load_config()
+    if not acquire_lock(cfg):
+        return
+    try:
+        _run(cfg, args)
+        if not args.dry_run:
+            set_last_error(None)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        if isinstance(e, SystemExit) and e.code in (None, 0):
+            raise
+        msg = str(e) or type(e).__name__
+        log("  ! calisma hata ile bitti: %s" % msg)
+        if not isinstance(e, SystemExit):
+            log(traceback.format_exc().rstrip())
+        set_last_error(msg)
+        notify(cfg, "Niche Radar hata", msg[:200])
+        raise
+    finally:
+        release_lock()
+
+
+def _run(cfg: dict, args) -> None:
     if not cfg["channels"]:
         raise SystemExit("Kanal yok. Once: radar.py add-channel @handle")
     check_report_dir_writable(report_dir(cfg))
@@ -736,10 +842,9 @@ def cmd_run(args) -> None:
     seen: dict = state["seen"]
     backlog: list = state["backlog"]
     pending: list = state["pending"]
+    baselined: dict = state["baselined"]  # kanal id -> baslangic noktasinin konuldugu zaman
     first_run = not state["initialized"]
     only = (args.only or "").lower()
-    if first_run and only:
-        raise SystemExit("Ilk calismada --only kullanilamaz (diger kanallarin baslangic noktasi konmaz). Once tam bir 'run' yap.")
     first_days = int(cfg.get("first_run_days") or 0)
     first_items = int(cfg.get("first_run_items") or 0)
     max_age = int(cfg["max_age_days"])
@@ -767,33 +872,42 @@ def cmd_run(args) -> None:
     for ch in cfg["channels"]:
         if not selected(ch["name"], ch.get("handle", "")):
             continue
+        ch_first = ch["id"] not in baselined  # ilk calisma YA DA sonradan eklenen kanal: gecmis penceresi uygulanir
+        ch_listed = 0
         for tab in cfg["tabs"]:
             n_disc = int(cfg["discover_items"])
-            if first_run:
+            if ch_first:
                 n_disc = max(n_disc, first_items)
             items = discover_tab(ch, tab, n_disc)
             time.sleep(cfg["sleep_seconds"])
             total_listed += len(items)
+            ch_listed += len(items)
             new = [i for i in items if i["id"] not in seen and i["id"] not in backlog_ids]
-            if first_run:
+            if ch_first:
                 n_keep = first_items if first_days > 0 else 0
                 keep = new[:n_keep]
                 for i in new[n_keep:]:
                     seen[i["id"]] = {"t": now(), "ch": ch["name"], "status": "baseline"}
                 new = keep
-            age = first_days if first_run else max_age
+            age = first_days if ch_first else max_age
             for i in new:
                 i["channel"] = ch["name"]
                 i["channel_id"] = ch["id"]
                 i["age_days"] = age
                 i["cutoff"] = (today - dt.timedelta(days=age)).isoformat()  # pencere kesifte sabitlenir
                 i["attempts"] = 0
-            log("  %s/%s: %d listelendi, %d yeni" % (ch["name"], tab, len(items), len(new)))
+            log("  %s/%s: %d listelendi, %d yeni%s" % (ch["name"], tab, len(items), len(new), " (yeni kanal)" if ch_first and not first_run else ""))
             lists.append(new)
+        if ch_first and ch_listed and not args.dry_run:
+            baselined[ch["id"]] = now()  # kesif bos donen kanal baslatilmis sayilmaz: sonraki calismada tekrar denenir
 
     if first_run and total_listed == 0:
         raise SystemExit("Kesif bos dondu (ag, VPN/Private Relay veya bot kontrolu). Baslangic noktasi KONMADI; "
                          "'doctor' calistir, sorunu giderip tekrar dene.")
+    if total_listed == 0 and any(selected(c["name"], c.get("handle", "")) for c in cfg["channels"]):
+        log("  ! kesif bos dondu (ag, VPN/Private Relay veya bot kontrolu?)")
+        if not args.dry_run:
+            notify(cfg, "Niche Radar", "Kesif bos dondu: ag, VPN/Private Relay ya da bot kontrolu olabilir. 'doctor' calistir.")
 
     # round-robin: her kanal/sekme sirayla pay alsin, tek kanal tavani yemesin
     queue, used = [], set()
@@ -818,7 +932,7 @@ def cmd_run(args) -> None:
         log("ilk calisma: %d mevcut icerik 'goruldu' sayildi (baseline), %d icerik islenecek" % (n_base, len(queue)))
     persist(state, others, [], queue)  # kesif sonucu hemen kalici: bundan sonra cokse bile backlog tutarli
 
-    retry, deferred, processed, streak, tripped = [], [], 0, 0, False
+    retry, deferred, processed, streak, tripped, claude_failures = [], [], 0, 0, False, 0
     for idx, i in enumerate(queue):
         if processed >= cap:
             deferred = queue[idx:]
@@ -847,6 +961,7 @@ def cmd_run(args) -> None:
                 summary = summarize(cfg, i, meta, transcript)
             except ClaudeError as e:
                 outcome, status = "retry", "claude: %s" % e
+                claude_failures += 1
         if outcome == "retry":
             i["attempts"] = int(i.get("attempts") or 0) + 1
             if i["attempts"] >= max_attempts:
@@ -880,6 +995,8 @@ def cmd_run(args) -> None:
     if tripped:
         log("  ! %d ardisik gecici hata: calisma durduruldu (ag / bot kontrolu / claude girisi?), kalanlar bekleyen listede" % streak)
         notify(cfg, "Niche Radar", "%d ardisik hata, calisma durduruldu; %d icerik bekleyen listede. 'doctor' calistir." % (streak, len(deferred) + len(retry)))
+    elif claude_failures and processed == 0:
+        notify(cfg, "Niche Radar", "Claude hicbir ozeti uretemedi (%d deneme). Terminalde 'claude -p ok' ve 'doctor' dene." % claude_failures)
 
     if not pending:
         log("yeni video yok, rapor yazilmadi")

@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,7 +50,7 @@ class RadarCase(unittest.TestCase):
         self.home = Path(self.tmp.name) / "NicheRadar"
         self.home.mkdir()
         for name, sub in (("HOME", ""), ("CONFIG", "config.json"), ("STATE", "state.json"),
-                          ("REPORTS", "reports"), ("LOGS", "logs"), ("CACHE", "cache")):
+                          ("REPORTS", "reports"), ("LOGS", "logs"), ("CACHE", "cache"), ("LOCK", "run.lock")):
             p = mock.patch.object(radar, name, self.home / sub if sub else self.home)
             p.start()
             self.addCleanup(p.stop)
@@ -379,7 +381,7 @@ class RetryAndPersistTests(RadarCase):
             radar.cmd_run(args)
         d.assert_not_called()
         self.assertIn("Rapor klasoru yazilamiyor", str(ctx.exception))
-        self.assertFalse(radar.STATE.exists())
+        self.assertEqual(set(self.read_state()), {"last_error"})  # seen/backlog'a dokunulmadi, sadece hata kaydi
 
     def test_only_preserves_other_backlog(self):
         nate = {"id": "NATE0000001", "title": "n", "tab": "videos", "channel": CHANNELS[0]["name"],
@@ -468,6 +470,131 @@ class ReportFileAndSiteTests(RadarCase):
         self.assertEqual((n_vid, stat), (2, "2 yeni içerik, 2 özet · 2 çalışma"))
         self.assertEqual(html.count("<details>"), 2)
         self.assertEqual(html.count("<hr>"), 3)  # 2 ozet ici + 1 calisma ayraci; sondaki '---' kirpildi
+
+
+THIRD = {"name": "AI Explained", "id": "UCNJ1Ymd5yFuUPtn21xtRbbw", "handle": "@aiexplained-official"}
+
+
+class LockErrorsAndBaselineTests(RadarCase):
+    """P3-11 (kilit), P3-10 (sessiz hata yok), P3-8 (kanal bazli baslangic noktasi)."""
+
+    def test_lock_blocks_concurrent_run(self):
+        radar.LOCK.write_text(json.dumps({"pid": os.getpid(), "t": "simdi"}), encoding="utf-8")
+        calls = self.run_once()
+        calls.discover.assert_not_called()
+        self.assertIn("baska bir calisma devam ediyor", self.log_text())
+        self.assertTrue(radar.LOCK.exists())  # baskasinin kilidine dokunulmaz
+
+    def test_stale_lock_is_replaced(self):
+        radar.LOCK.write_text(json.dumps({"pid": 999999, "t": "dun"}), encoding="utf-8")
+        calls = self.run_once()
+        self.assertGreater(calls.discover.call_count, 0)
+        self.assertIn("eski kilit siliniyor", self.log_text())
+        self.assertFalse(radar.LOCK.exists())
+
+    def test_old_lock_by_age_is_replaced_even_with_live_pid(self):
+        self.write_config(lock_stale_hours=1)
+        radar.LOCK.write_text(json.dumps({"pid": os.getpid(), "t": "eski"}), encoding="utf-8")
+        old = time.time() - 2 * 3600
+        os.utime(radar.LOCK, (old, old))
+        calls = self.run_once()
+        self.assertGreater(calls.discover.call_count, 0)
+
+    def test_lock_released_on_exception(self):
+        def boom(ch, tab, n):
+            raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            self.run_once(discover=boom)
+        self.assertFalse(radar.LOCK.exists())
+
+    def test_unhandled_exception_notifies_and_records(self):
+        def boom(ch, tab, n):
+            raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            self.run_once(discover=boom)
+        self.assertEqual(self.notifications[-1][0], "Niche Radar hata")
+        self.assertIn("boom", self.read_state()["last_error"]["msg"])
+        self.assertIn("Traceback", self.log_text())
+
+    def test_systemexit_with_message_notifies(self):
+        blocker = self.home / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        self.write_config(report_dir=str(blocker / "reports"))
+        with self.assertRaises(SystemExit):
+            self.run_once()
+        self.assertTrue(any(t == "Niche Radar hata" and "Rapor klasoru" in b for t, b in self.notifications))
+        self.assertIn("Rapor klasoru", self.read_state()["last_error"]["msg"])
+        self.assertFalse(radar.LOCK.exists())
+
+    def test_successful_run_clears_last_error(self):
+        self.run_once()
+        st = self.read_state()
+        st["last_error"] = {"t": "x", "msg": "eski hata"}
+        self.write_state(st)
+        self.run_once()
+        self.assertIsNone(self.read_state()["last_error"])
+
+    def test_empty_discovery_notifies_after_baseline(self):
+        self.run_once()
+        self.run_once(discover=lambda ch, tab, n: [])
+        self.assertTrue(any("Kesif bos dondu" in b for _, b in self.notifications))
+
+    def test_all_claude_failures_notify(self):
+        def ask(cfg, prompt, timeout=420):
+            raise radar.ClaudeError("login yok")
+        self.run_once(ask=ask)
+        self.assertTrue(any("hicbir ozeti uretemedi" in b for _, b in self.notifications))
+
+    def test_new_channel_gets_baseline(self):
+        self.run_once()
+        state = self.read_state()
+        self.assertEqual(set(state["baselined"]), {c["id"] for c in CHANNELS})
+        self.write_config(channels=[dict(c) for c in CHANNELS] + [dict(THIRD)])
+        with mock.patch("test_radar.CHANNELS", CHANNELS + [THIRD]):
+            self.run_once()
+        state = self.read_state()
+        self.assertIn(THIRD["id"], state["baselined"])
+        third = {k: v for k, v in state["seen"].items() if v["ch"] == THIRD["name"]}
+        self.assertEqual([v["status"] for v in third.values()].count("baseline"), 4)  # sekme basina 2
+        self.assertEqual([v["status"] for v in third.values()].count("altyazi"), 2)  # sekme basina 1 islendi
+        self.assertIn("(yeni kanal)", self.log_text())
+
+    def test_new_channel_with_zero_history_only_baselines(self):
+        self.write_config(first_run_days=0, first_run_items=0)
+        self.run_once()
+        self.write_config(first_run_days=0, first_run_items=0, channels=[dict(c) for c in CHANNELS] + [dict(THIRD)])
+        with mock.patch("test_radar.CHANNELS", CHANNELS + [THIRD]):
+            calls = self.run_once()
+        calls.fetch.assert_not_called()
+        third = {k: v for k, v in self.read_state()["seen"].items() if v["ch"] == THIRD["name"]}
+        self.assertEqual(len(third), 6)
+        self.assertTrue(all(v["status"] == "baseline" for v in third.values()))
+
+    def test_channel_with_empty_discovery_not_baselined(self):
+        def discover(ch, tab, n):
+            return [] if ch["id"] == CHANNELS[1]["id"] else self.discover_n(3)(ch, tab, n)
+        self.run_once(discover=discover)
+        state = self.read_state()
+        self.assertEqual(list(state["baselined"]), [CHANNELS[0]["id"]])
+        self.run_once()  # Matt bu kez listeleniyor -> simdi baslangic noktasi konur, gecmis penceresi uygulanir
+        state = self.read_state()
+        self.assertIn(CHANNELS[1]["id"], state["baselined"])
+        matt = [v["status"] for v in state["seen"].values() if v["ch"] == CHANNELS[1]["name"]]
+        self.assertEqual((matt.count("baseline"), matt.count("altyazi")), (4, 2))
+
+    def test_only_allowed_on_fresh_state(self):
+        self.run_once(only="matt")
+        state = self.read_state()
+        self.assertEqual(list(state["baselined"]), [CHANNELS[1]["id"]])
+        self.run_once()  # Nate simdi ilk-calisma muamelesi gorur
+        state = self.read_state()
+        nate = [v["status"] for v in state["seen"].values() if v["ch"] == CHANNELS[0]["name"]]
+        self.assertEqual((nate.count("baseline"), nate.count("altyazi")), (4, 2))
+
+    def test_dry_run_does_not_baseline(self):
+        self.run_once(dry_run=True)
+        self.assertFalse(radar.STATE.exists())
+        self.assertFalse(radar.LOCK.exists())
 
 
 if __name__ == "__main__":
