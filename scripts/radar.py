@@ -62,6 +62,8 @@ DEFAULT_CONFIG = {
     "first_run_days": 7,
     "max_per_run": 20,
     "max_age_days": 14,
+    "max_attempts": 3,
+    "max_consecutive_failures": 5,
     "sub_langs": ["en", "tr"],
     "summary_lang": "Türkçe",
     "model": "sonnet",
@@ -307,13 +309,36 @@ def pick_vtt(folder: Path, langs: list) -> Path | None:
     return files[0]
 
 
+def read_meta(meta_file: Path) -> dict:
+    meta = {"upload_date": "", "duration": "", "view_count": "", "channel": "", "title": ""}
+    if meta_file.exists():
+        line = meta_file.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+        if line:
+            p = line[0].split("\t", 4)
+            if len(p) == 5:
+                meta = dict(zip(["upload_date", "duration", "view_count", "channel", "title"], p))
+    return meta
+
+
 def fetch_transcript(cfg: dict, vid: str) -> tuple:
-    """-> (meta: dict, transcript: str, status: str)"""
+    """-> (meta: dict, transcript: str, status: str)
+
+    status "hata: ..." ve "transkript yok" gecicidir (sonraki calismada tekrar denenir),
+    "altyazi" / "whisper" kalicidir. Basarili transkript cache/subs/<id>/transcript.txt'ye yazilir:
+    ozet asamasi (Claude) basarisiz olursa tekrar denemede yt-dlp'ye gidilmez.
+    """
     folder = CACHE / "subs" / vid
+    meta_file = folder / "meta.txt"
+    cached = folder / "transcript.txt"
+    if cached.exists() and meta_file.exists():
+        meta = read_meta(meta_file)
+        text = cached.read_text(encoding="utf-8", errors="ignore").strip()
+        if meta["title"] and len(text) > 200:
+            log("   transkript onbellekten (%s)" % cached.name)
+            return meta, text, "altyazi"
     if folder.exists():
         shutil.rmtree(folder, ignore_errors=True)
     folder.mkdir(parents=True, exist_ok=True)
-    meta_file = folder / "meta.txt"
     langs = cfg["sub_langs"]
     sub_langs = ",".join("%s.*" % l for l in langs)
     url = "https://www.youtube.com/watch?v=%s" % vid
@@ -321,7 +346,7 @@ def fetch_transcript(cfg: dict, vid: str) -> tuple:
            "--sub-langs", sub_langs, "--sub-format", "vtt", "--no-warnings", "-q",
            "--print-to-file", "%(upload_date)s\t%(duration)s\t%(view_count)s\t%(channel)s\t%(title)s", str(meta_file),
            "-o", str(folder / "%(id)s.%(ext)s")] + list(cfg.get("ytdlp_extra_args", [])) + [url]
-    meta = {"upload_date": "", "duration": "", "view_count": "", "channel": "", "title": ""}
+    meta = read_meta(meta_file)
     last_err = ""
     for attempt in (1, 2):
         try:
@@ -330,11 +355,7 @@ def fetch_transcript(cfg: dict, vid: str) -> tuple:
             last_err = "timeout"
             continue
         if meta_file.exists():
-            line = meta_file.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
-            if line:
-                p = line[0].split("\t", 4)
-                if len(p) == 5:
-                    meta = dict(zip(["upload_date", "duration", "view_count", "channel", "title"], p))
+            meta = read_meta(meta_file)
             break
         last_err = r.stderr.strip()[-300:]
         time.sleep(3 * attempt)
@@ -344,11 +365,14 @@ def fetch_transcript(cfg: dict, vid: str) -> tuple:
     if vtt:
         text = parse_vtt(vtt)
         if len(text) > 200:
+            log("   altyazi: %s" % vtt.name)
+            cached.write_text(text, encoding="utf-8")
             return meta, text, "altyazi"
     # yedek: Whisper (opsiyonel, ffmpeg gerektirir)
     if cfg["whisper"].get("enabled"):
         text = whisper_transcript(cfg, vid, folder)
         if text:
+            cached.write_text(text, encoding="utf-8")
             return meta, text, "whisper"
         return meta, "", "transkript yok (whisper basarisiz)"
     return meta, "", "transkript yok"
@@ -656,39 +680,91 @@ def cmd_doctor(args) -> None:
 
 
 def _slim(i: dict) -> dict:
-    return {k: i[k] for k in ("id", "title", "tab", "channel", "age_days") if k in i}
+    return {k: i[k] for k in ("id", "title", "tab", "channel", "channel_id", "age_days", "cutoff", "attempts") if k in i}
+
+
+def is_transient(status: str) -> bool:
+    """Gecici durumlar sonraki calismada tekrar denenir; 'altyazi', 'eski', 'vazgecildi' kalicidir."""
+    return status.startswith(("hata:", "transkript yok", "claude:"))
+
+
+def load_state(cfg: dict) -> dict:
+    """state.json + eski surumlerden migrasyon (eksik anahtarlar varsayilanla acilir)."""
+    s = load_json(STATE, {})
+    s.setdefault("seen", {})
+    s.setdefault("initialized", False)
+    today = dt.date.today()
+    max_age = int(cfg["max_age_days"])
+    backlog = []
+    for i in s.get("backlog") or []:
+        if not i.get("id") or i["id"] in s["seen"]:
+            continue
+        i.setdefault("cutoff", (today - dt.timedelta(days=int(i.get("age_days", max_age)))).isoformat())
+        i.setdefault("attempts", 0)
+        backlog.append(i)
+    s["backlog"] = backlog
+    s.setdefault("pending", [])
+    s.setdefault("last_error", None)
+    return s
+
+
+def persist(state: dict, others: list, retry: list, remaining: list) -> None:
+    """Bekleyen liste = bu calismaya girmeyenler (--only) + tekrar denenecekler + henuz islenmeyenler."""
+    state["backlog"] = [_slim(x) for x in others] + [_slim(x) for x in retry] + [_slim(x) for x in remaining]
+    save_json(STATE, state)
+
+
+def check_report_dir_writable(rdir: Path) -> None:
+    """Ozet uretmeden ONCE rapor klasorunu dene (launchd altinda Documents/iCloud izni reddedilebilir)."""
+    try:
+        rdir.mkdir(parents=True, exist_ok=True)
+        probe = rdir / (".nis-radar-probe-%d" % os.getpid())
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        raise SystemExit("Rapor klasoru yazilamiyor: %s (%s). config.json report_dir'i kontrol et; "
+                         "launchd icin klasor izni / Tam Disk Erisimi gerekebilir." % (rdir, e))
 
 
 def cmd_run(args) -> None:
     cfg = load_config()
     if not cfg["channels"]:
         raise SystemExit("Kanal yok. Once: radar.py add-channel @handle")
-    state = load_json(STATE, {"seen": {}, "initialized": False, "backlog": []})
-    seen: dict = state.setdefault("seen", {})
-    backlog: list = [i for i in (state.get("backlog") or []) if i.get("id") not in seen]
-    first_run = not state.get("initialized")
+    check_report_dir_writable(report_dir(cfg))
+    state = load_state(cfg)
+    seen: dict = state["seen"]
+    backlog: list = state["backlog"]
+    pending: list = state["pending"]
+    first_run = not state["initialized"]
     only = (args.only or "").lower()
     if first_run and only:
         raise SystemExit("Ilk calismada --only kullanilamaz (diger kanallarin baslangic noktasi konmaz). Once tam bir 'run' yap.")
     first_days = int(cfg.get("first_run_days") or 0)
     first_items = int(cfg.get("first_run_items") or 0)
     max_age = int(cfg["max_age_days"])
-    log("=== run basladi (first_run=%s dry_run=%s no_llm=%s bekleyen=%d)" % (first_run, args.dry_run, args.no_llm, len(backlog)))
+    max_attempts = int(cfg.get("max_attempts") or 3)
+    max_streak = int(cfg.get("max_consecutive_failures") or 5)
+    today = dt.date.today()
+    log("=== run basladi (first_run=%s dry_run=%s no_llm=%s bekleyen=%d devralinan_ozet=%d)" % (
+        first_run, args.dry_run, args.no_llm, len(backlog), len(pending)))
+
+    def selected(name: str, handle: str = "") -> bool:
+        return not only or only in (name or "").lower() or only in (handle or "").lower()
 
     lists: list = []  # kanal/sekme basina listeler; sonra round-robin birlestirilir
-    if backlog:
+    others = [i for i in backlog if not selected(i.get("channel", ""))]  # --only disinda kalanlar korunur
+    mine = [i for i in backlog if selected(i.get("channel", ""))]
+    if mine:
         groups: dict = {}
-        for i in backlog:
-            if only and only not in i.get("channel", "").lower():
-                continue
+        for i in mine:
             groups.setdefault((i.get("channel"), i.get("tab")), []).append(i)
         lists.extend(groups.values())
-        log("bekleyen: %d icerik onceki calismalardan devraliniyor" % sum(len(v) for v in groups.values()))
+        log("bekleyen: %d icerik onceki calismalardan devraliniyor" % len(mine))
     backlog_ids = {i["id"] for i in backlog}
 
     total_listed = 0
     for ch in cfg["channels"]:
-        if only and only not in ch["name"].lower() and only not in ch.get("handle", "").lower():
+        if not selected(ch["name"], ch.get("handle", "")):
             continue
         for tab in cfg["tabs"]:
             n_disc = int(cfg["discover_items"])
@@ -704,9 +780,13 @@ def cmd_run(args) -> None:
                 for i in new[n_keep:]:
                     seen[i["id"]] = {"t": now(), "ch": ch["name"], "status": "baseline"}
                 new = keep
+            age = first_days if first_run else max_age
             for i in new:
                 i["channel"] = ch["name"]
-                i["age_days"] = first_days if first_run else max_age
+                i["channel_id"] = ch["id"]
+                i["age_days"] = age
+                i["cutoff"] = (today - dt.timedelta(days=age)).isoformat()  # pencere kesifte sabitlenir
+                i["attempts"] = 0
             log("  %s/%s: %d listelendi, %d yeni" % (ch["name"], tab, len(items), len(new)))
             lists.append(new)
 
@@ -722,29 +802,29 @@ def cmd_run(args) -> None:
                 used.add(l[k]["id"])
                 queue.append(l[k])
 
-    if first_run and first_days <= 0 and not queue and not args.dry_run:
-        state["initialized"] = True
-        state["last_run"] = now()
-        state["backlog"] = []
-        save_json(STATE, state)
-        n_base = sum(1 for v in seen.values() if v.get("status") == "baseline")
-        log("ilk calisma: gecmis istenmedi; mevcut %d icerik 'goruldu' sayildi, bundan sonraki yuklemeler islenecek" % n_base)
-        return
-
     cap = min(args.limit or cfg["max_per_run"], cfg["max_per_run"])
     log("kuyruk: %d icerik, bu calismada en fazla %d islenecek (pencere disindakiler sayilmaz)" % (len(queue), cap))
 
     if args.dry_run:
         for i in queue:
-            print("  [%s] %s  %s  https://youtu.be/%s  (pencere %d gun)" % (i["tab"], i["channel"], i["title"], i["id"], i.get("age_days", max_age)))
+            print("  [%s] %s  %s  https://youtu.be/%s  (pencere %s'den itibaren)" % (
+                i["tab"], i["channel"], i["title"], i["id"], i.get("cutoff", "?")))
         log("dry-run bitti, state degismedi")
         return
 
-    results, deferred, processed = [], [], 0
-    today = dt.date.today()
+    if first_run:
+        n_base = sum(1 for v in seen.values() if v.get("status") == "baseline")
+        log("ilk calisma: %d mevcut icerik 'goruldu' sayildi (baseline), %d icerik islenecek" % (n_base, len(queue)))
+    persist(state, others, [], queue)  # kesif sonucu hemen kalici: bundan sonra cokse bile backlog tutarli
+
+    retry, deferred, processed, streak, tripped = [], [], 0, 0, False
     for idx, i in enumerate(queue):
         if processed >= cap:
             deferred = queue[idx:]
+            break
+        if streak >= max_streak:
+            deferred = queue[idx:]
+            tripped = True
             break
         log("-> %s | %s" % (i["channel"], i["title"][:70]))
         meta, transcript, status = fetch_transcript(cfg, i["id"])
@@ -753,53 +833,88 @@ def cmd_run(args) -> None:
             up = dt.datetime.strptime(meta.get("upload_date", ""), "%Y%m%d").date()
         except ValueError:
             up = None
-        cutoff = today - dt.timedelta(days=int(i.get("age_days", max_age)))
+        cutoff = dt.date.fromisoformat(i.get("cutoff") or (today - dt.timedelta(days=int(i.get("age_days", max_age)))).isoformat())
+        summary, outcome = "", "ok"
         if up and up < cutoff:
-            status = "eski (%s), atlandi" % up.isoformat()
-            transcript = ""
+            outcome, status, transcript = "old", "eski (%s), atlandi" % up.isoformat(), ""
+        elif is_transient(status):
+            outcome = "retry"
+        elif args.no_llm:
+            summary = "_(no-llm modu: ozet uretilmedi; transkript %d karakter)_" % len(transcript)
         else:
-            processed += 1
-        summary, ok = "", False
-        if transcript and not args.no_llm:
             try:
                 summary = summarize(cfg, i, meta, transcript)
-                ok = True
             except ClaudeError as e:
-                status = "claude hatasi: %s" % e
-        elif transcript:
-            summary = "_(no-llm modu: ozet uretilmedi; transkript %d karakter)_" % len(transcript)
-        seen[i["id"]] = {"t": now(), "ch": i["channel"], "status": status}
-        results.append({"item": i, "meta": meta, "status": status, "summary": summary, "chars": len(transcript), "ok": ok})
-        state["backlog"] = [_slim(x) for x in queue[idx + 1:]]  # yarida kesilirse kalanlar kaybolmasin
-        save_json(STATE, state)
+                outcome, status = "retry", "claude: %s" % e
+        if outcome == "retry":
+            i["attempts"] = int(i.get("attempts") or 0) + 1
+            if i["attempts"] >= max_attempts:
+                outcome, status = "gaveup", "vazgecildi (%d deneme): %s" % (i["attempts"], status)
+            else:
+                status = "%s (deneme %d/%d, sonraki calismada tekrar)" % (status, i["attempts"], max_attempts)
+                retry.append(i)
+        if outcome in ("ok", "old", "gaveup"):
+            entry = {"t": now(), "ch": i["channel"], "status": status}
+            if outcome == "gaveup":
+                entry["attempts"] = i["attempts"]
+            seen[i["id"]] = entry
+        if outcome == "ok":
+            processed += 1
+            streak = 0
+        elif outcome in ("retry", "gaveup"):
+            streak += 1
+        pending.append({"item": _slim(i), "meta": meta, "status": status, "summary": summary,
+                        "chars": len(transcript), "ok": outcome == "ok" and not args.no_llm})
+        persist(state, others, retry, queue[idx + 1:])  # yarida kesilirse ne ozet ne kuyruk kaybolsun
         log("   durum: %s" % status)
 
-    state["backlog"] = [_slim(x) for x in deferred]
+    persist(state, others, retry, deferred)
     state["initialized"] = True
     state["last_run"] = now()
     save_json(STATE, state)
     if deferred:
         log("%d icerik sonraki calismaya ertelendi (bekleyen listede tutuluyor)" % len(deferred))
+    if retry:
+        log("%d icerik gecici hata: sonraki calismada tekrar denenecek" % len(retry))
+    if tripped:
+        log("  ! %d ardisik gecici hata: calisma durduruldu (ag / bot kontrolu / claude girisi?), kalanlar bekleyen listede" % streak)
+        notify(cfg, "Niche Radar", "%d ardisik hata, calisma durduruldu; %d icerik bekleyen listede. 'doctor' calistir." % (streak, len(deferred) + len(retry)))
 
-    if not results:
+    if not pending:
         log("yeni video yok, rapor yazilmadi")
         return
 
-    path = write_report(cfg, results, args.no_llm)
+    rdir = report_dir(cfg)
+    path = None
+    try:
+        path = write_report(cfg, pending, args.no_llm, rdir)
+    except OSError as e:
+        log("  ! rapor yazilamadi (%s): %s" % (rdir, e))
+        if rdir != REPORTS:
+            try:
+                path = write_report(cfg, pending, args.no_llm, REPORTS)
+                notify(cfg, "Niche Radar", "Rapor klasoru yazilamadi, yedek klasore yazildi: %s" % path)
+            except OSError as e2:
+                log("  ! yedek klasore de yazilamadi: %s" % e2)
+    if path is None:
+        notify(cfg, "Niche Radar hata", "Rapor yazilamadi; %d ozet bekleyen listede, sonraki calismada yazilacak" % len(pending))
+        return
+    state["pending"] = []  # rapor diske indi, ozetler artik guvende
+    save_json(STATE, state)
     log("rapor: %s" % path)
     try:
         log("sayfa: %s" % build_site(cfg))
     except Exception as e:  # noqa: BLE001
         log("  ! sayfa uretilemedi: %s" % e)
-    n_ok = sum(1 for r in results if r["ok"])
-    n_in = sum(1 for r in results if not r["status"].startswith("eski"))
+    n_ok = sum(1 for r in pending if r["ok"])
+    n_in = sum(1 for r in pending if not r["status"].startswith("eski"))
     notify(cfg, "Niche Radar", "%d yeni icerik, %d ozet hazir. %s" % (n_in, n_ok, path.name))
     log("=== run bitti (claude: %d cagri, %d giris + %d onbellek token, %d cikis)" % (
         CLAUDE_USAGE["calls"], CLAUDE_USAGE["input"], CLAUDE_USAGE["cache"], CLAUDE_USAGE["output"]))
 
 
-def write_report(cfg: dict, results: list, no_llm: bool) -> Path:
-    rdir = report_dir(cfg)
+def write_report(cfg: dict, results: list, no_llm: bool, rdir: Path | None = None) -> Path:
+    rdir = rdir or report_dir(cfg)
     rdir.mkdir(parents=True, exist_ok=True)
     today = dt.date.today().isoformat()
     path = rdir / ("%s.md" % today)

@@ -221,14 +221,198 @@ class ClaudeIsolationTests(RadarCase):
             self.assertEqual(radar.make_digest(cfg, ["a", "b"]), "")
         self.assertIn("gunun ozeti uretilemedi", self.log_text())
 
-    def test_claude_error_in_run_is_reported(self):
+    def test_claude_error_is_transient(self):
+        """Claude hatasi: icerik seen'e yazilmaz, backlog'a attempts=1 ile doner, raporda durum gorunur."""
         def ask(cfg, prompt, timeout=420):
             raise radar.ClaudeError("cikis kodu 1: login yok")
         self.run_once(ask=ask)
+        state = self.read_state()
+        self.assertEqual([v["status"] for v in state["seen"].values()].count("baseline"), 8)
+        self.assertEqual(len(state["seen"]), 8)
+        self.assertEqual(len(state["backlog"]), 4)
+        self.assertTrue(all(b["attempts"] == 1 for b in state["backlog"]))
         text = self.report_files()[0].read_text(encoding="utf-8")
         self.assertIn("**4 yeni içerik**, 0 özet", text)
-        self.assertIn("claude hatasi: cikis kodu 1: login yok", text)
-        self.assertIn("0 ozet hazir", self.notifications[0][1])
+        self.assertIn("claude: cikis kodu 1: login yok (deneme 1/3, sonraki calismada tekrar)", text)
+        self.assertIn("0 ozet hazir", self.notifications[-1][1])
+
+
+def fetch_fail(cfg, item_id):
+    return meta_for(item_id), "", "transkript yok"
+
+
+class RetryAndPersistTests(RadarCase):
+    """P2-1 (gecici hata -> tekrar), P2-3 (ozetler rapordan once kalici), P3-7 (--only), P3-9 (sabit pencere)."""
+
+    def test_transient_not_seen_and_retried(self):
+        self.run_once(fetch=fetch_fail)
+        state = self.read_state()
+        self.assertEqual(len(state["seen"]), 8)  # sadece baseline; 4 icerik seen'e yazilmadi
+        self.assertEqual(len(state["backlog"]), 4)
+        for b in state["backlog"]:
+            self.assertEqual(b["attempts"], 1)
+            self.assertEqual(b["cutoff"], (TODAY - dt.timedelta(days=7)).isoformat())
+            self.assertEqual(b["channel_id"], next(c["id"] for c in CHANNELS if c["name"] == b["channel"]))
+        self.assertIn("transkript yok (deneme 1/3, sonraki calismada tekrar)", self.report_files()[0].read_text(encoding="utf-8"))
+        # ikinci calisma: ayni icerikler backlog'dan gelir, bu kez altyazi var -> ozetlenir
+        calls = self.run_once()
+        state = self.read_state()
+        self.assertEqual([v["status"] for v in state["seen"].values()].count("altyazi"), 4)
+        self.assertEqual(state["backlog"], [])
+        self.assertEqual(calls.fetch.call_count, 4)
+        self.assertIn("**4 yeni içerik**, 4 özet", self.report_files()[0].read_text(encoding="utf-8"))
+
+    def test_give_up_after_max_attempts(self):
+        self.write_config(max_attempts=2)
+        self.run_once(fetch=fetch_fail)
+        self.run_once(fetch=fetch_fail)
+        state = self.read_state()
+        gave = {k: v for k, v in state["seen"].items() if v["status"].startswith("vazgecildi")}
+        self.assertEqual(len(gave), 4)
+        self.assertTrue(all(v["attempts"] == 2 and "transkript yok" in v["status"] for v in gave.values()))
+        self.assertEqual(state["backlog"], [])
+
+    def test_transient_does_not_consume_cap(self):
+        first_id = vid(0, "videos", 1)  # round-robin sirasinda ilk eleman
+
+        def fetch(cfg, item_id):
+            return fetch_fail(cfg, item_id) if item_id == first_id else self.fetch_ok(cfg, item_id)
+        self.run_once(fetch=fetch, limit=1)
+        state = self.read_state()
+        self.assertEqual([v["status"] for v in state["seen"].values()].count("altyazi"), 1)
+        self.assertNotIn(first_id, state["seen"])
+        self.assertEqual(len(state["backlog"]), 3)  # 1 tekrar + 2 ertelenen
+        self.assertEqual(state["backlog"][0]["id"], first_id)
+        self.assertEqual(state["backlog"][0]["attempts"], 1)
+
+    def test_circuit_breaker(self):
+        self.write_config(first_run_items=3, max_consecutive_failures=2)
+        calls = self.run_once(fetch=fetch_fail)
+        state = self.read_state()
+        self.assertEqual(calls.fetch.call_count, 2)  # 2 ardisik hata -> dur
+        self.assertEqual(len(state["backlog"]), 12)  # 2 tekrar + 10 ertelenen, hicbiri kaybolmadi
+        self.assertEqual(len(state["seen"]), 0)
+        self.assertTrue(any("ardisik hata" in body for _, body in self.notifications))
+        self.assertEqual(len(self.report_files()), 1)  # tamamlananlar icin rapor yine yazilir
+
+    def test_success_resets_streak(self):
+        self.write_config(first_run_items=3, max_consecutive_failures=2)
+        toggle = {"n": 0}
+
+        def fetch(cfg, item_id):
+            toggle["n"] += 1
+            return fetch_fail(cfg, item_id) if toggle["n"] % 2 else self.fetch_ok(cfg, item_id)
+        calls = self.run_once(fetch=fetch)
+        self.assertEqual(calls.fetch.call_count, 12)
+        self.assertFalse(any("ardisik hata" in body for _, body in self.notifications))
+
+    def test_fetch_transcript_uses_cache(self):
+        cfg = radar.load_config()
+        folder = radar.CACHE / "subs" / "abcdefghijk"
+        folder.mkdir(parents=True)
+        (folder / "meta.txt").write_text("20260914\t60\t100\tKanal\tBaslik\n", encoding="utf-8")
+        (folder / "transcript.txt").write_text("kelime " * 100, encoding="utf-8")
+        with mock.patch.object(radar, "run") as r:
+            meta, text, status = radar.fetch_transcript(cfg, "abcdefghijk")
+        r.assert_not_called()
+        self.assertEqual((status, meta["title"]), ("altyazi", "Baslik"))
+        self.assertGreater(len(text), 200)
+        # onbellek yoksa yt-dlp cagrilir ve transcript.txt olusur
+        (folder / "transcript.txt").unlink()
+
+        def fake_ytdlp(cmd, timeout=120, stdin=None, cwd=None):
+            meta_path = Path(next(a for a in cmd if a.endswith("meta.txt")))
+            meta_path.write_text("20260914\t60\t100\tKanal\tBaslik\n", encoding="utf-8")
+            (meta_path.parent / "abcdefghijk.en-orig.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n" + "kelime " * 100 + "\n", encoding="utf-8")
+            return completed("")
+        with mock.patch.object(radar, "run", side_effect=fake_ytdlp) as r:
+            meta, text, status = radar.fetch_transcript(cfg, "abcdefghijk")
+        self.assertEqual(r.call_count, 1)
+        self.assertEqual(status, "altyazi")
+        self.assertTrue((folder / "transcript.txt").exists())
+        self.assertIn("altyazi: abcdefghijk.en-orig.vtt", self.log_text())
+
+    def test_pending_survives_report_failure(self):
+        real = radar.write_report
+        boom = {"left": 1}
+
+        def flaky(cfg, results, no_llm, rdir=None):
+            if boom["left"]:
+                boom["left"] -= 1
+                raise OSError(13, "Permission denied")
+            return real(cfg, results, no_llm, rdir)
+        with mock.patch.object(radar, "write_report", side_effect=flaky):
+            self.run_once()
+            state = self.read_state()
+            self.assertEqual(len(state["pending"]), 4)
+            self.assertEqual([v["status"] for v in state["seen"].values()].count("altyazi"), 4)
+            self.assertEqual(self.report_files(), [])
+            self.assertTrue(any("Rapor yazilamadi" in body for _, body in self.notifications))
+            calls = self.run_once()  # yeni icerik yok ama devralinan 4 ozet rapora girer
+        self.assertEqual(calls.fetch.call_count, 0)
+        self.assertEqual(self.read_state()["pending"], [])
+        text = self.report_files()[0].read_text(encoding="utf-8")
+        self.assertIn("**4 yeni içerik**, 4 özet", text)
+        self.assertEqual(text.count("### ["), 4)
+
+    def test_report_fallback_to_home_reports(self):
+        custom = self.home / "vault" / "radar"
+        self.write_config(report_dir=str(custom))
+
+        def ask(cfg, prompt, timeout=420):
+            if custom.is_dir():  # ozetler uretilirken klasor yazilamaz hale gelsin
+                shutil.rmtree(custom)
+                custom.write_text("artik dosya", encoding="utf-8")
+            return "**Tek cümle:** ozet"
+        self.run_once(ask=ask)
+        self.assertEqual(len(self.report_files()), 1)  # REPORTS altina yedek yazim
+        self.assertEqual(self.read_state()["pending"], [])
+        self.assertTrue(any("yedek klasore" in body for _, body in self.notifications))
+
+    def test_preflight_unwritable_report_dir(self):
+        blocker = self.home / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        self.write_config(report_dir=str(blocker / "reports"))
+        args = SimpleNamespace(dry_run=False, no_llm=False, limit=0, only="")
+        with mock.patch.object(radar, "discover_tab") as d, self.assertRaises(SystemExit) as ctx:
+            radar.cmd_run(args)
+        d.assert_not_called()
+        self.assertIn("Rapor klasoru yazilamiyor", str(ctx.exception))
+        self.assertFalse(radar.STATE.exists())
+
+    def test_only_preserves_other_backlog(self):
+        nate = {"id": "NATE0000001", "title": "n", "tab": "videos", "channel": CHANNELS[0]["name"],
+                "channel_id": CHANNELS[0]["id"], "age_days": 14, "cutoff": (TODAY - dt.timedelta(days=14)).isoformat(), "attempts": 2}
+        matt = dict(nate, id="MATT0000001", channel=CHANNELS[1]["name"], channel_id=CHANNELS[1]["id"])
+        self.write_state({"seen": {}, "initialized": True, "backlog": [nate, matt]})
+        self.run_once(discover=lambda ch, tab, n: [], only="matt")
+        state = self.read_state()
+        self.assertIn("MATT0000001", state["seen"])
+        self.assertEqual(state["backlog"], [nate])  # Nate'in bekleyeni alanlariyla birlikte korunur
+
+    def test_cutoff_stored_and_used(self):
+        old = {"id": "OLDER000001", "title": "o", "tab": "videos", "channel": CHANNELS[0]["name"],
+               "channel_id": CHANNELS[0]["id"], "age_days": 7, "cutoff": (TODAY - dt.timedelta(days=30)).isoformat(), "attempts": 0}
+        self.write_state({"seen": {}, "initialized": True, "backlog": [old]})
+        self.run_once(discover=lambda ch, tab, n: [], fetch=lambda cfg, i: (meta_for(i, days_old=20), "kelime " * 200, "altyazi"))
+        state = self.read_state()
+        self.assertEqual(state["seen"]["OLDER000001"]["status"], "altyazi")  # 30 gunluk pencere korundu, "eski" degil
+
+    def test_state_migration_live_shape(self):
+        seen = {vid(0, "videos", k): {"t": "2026-09-13 20:39:39", "ch": CHANNELS[0]["name"], "status": "baseline"} for k in range(1, 41)}
+        self.write_state({"seen": seen, "initialized": True, "last_run": "2026-09-13 20:41:27"})  # backlog/pending yok
+
+        def discover(ch, tab, n):
+            items = [i for i in self.discover_n(3)(ch, tab, n) if i["id"] in seen]
+            if ch["id"] == CHANNELS[0]["id"] and tab == "videos":
+                items.insert(0, {"id": "NEWVIDEO001", "title": "yeni", "tab": tab})
+            return items
+        self.run_once(discover=discover)
+        state = self.read_state()
+        self.assertEqual(len(state["seen"]), 41)
+        self.assertEqual(state["seen"]["NEWVIDEO001"]["status"], "altyazi")
+        self.assertEqual((state["backlog"], state["pending"], state["last_error"]), ([], [], None))
 
 
 if __name__ == "__main__":
