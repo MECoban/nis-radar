@@ -53,6 +53,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
 LABEL = "com.nicheradar.daily"
+REPORT_MARK = "# Niche Radar · "  # rapor dosyalarinin ilk satiri; baska araclarin .md dosyalarindan ayirt eder
 
 DEFAULT_CONFIG = {
     "channels": [],
@@ -918,6 +919,11 @@ def write_report(cfg: dict, results: list, no_llm: bool, rdir: Path | None = Non
     rdir.mkdir(parents=True, exist_ok=True)
     today = dt.date.today().isoformat()
     path = rdir / ("%s.md" % today)
+    if path.exists() and not is_radar_report(path):
+        # report_dir bir not klasoruyse (Obsidian gunlugu vb.) ayni isimli kisisel dosyaya ASLA ekleme yapma
+        alt = rdir / ("%s.nis-radar.md" % today)
+        log("  ! %s bu aracin raporu degil (ilk satir farkli); dokunulmadi, rapor %s dosyasina yaziliyor" % (path.name, alt.name))
+        path = alt
     blocks, sections = [], []
     for r in results:
         if r["status"].startswith("eski"):
@@ -953,7 +959,7 @@ def write_report(cfg: dict, results: list, no_llm: bool, rdir: Path | None = Non
         head_line += ", %d tarih penceresi dışı" % n_old
     if n_err:
         head_line += ", %d atlandı/hatalı" % n_err
-    out = ["# Niche Radar · %s" % today, "", head_line + ". Üretim: %s" % now(), ""]
+    out = [REPORT_MARK + today, "", head_line + ". Üretim: %s" % now(), ""]
     if digest:
         out += ["## Günün öne çıkanları", "", digest, ""]
     if sections:
@@ -1087,30 +1093,55 @@ footer{grid-column:1/-1;color:var(--muted);font-size:13px;border-top:1px solid v
 """
 
 
+def is_radar_report(path: Path) -> bool:
+    """Sadece bu aracin yazdigi dosyalar (ilk satir REPORT_MARK). Kisisel notlar siteye/artifact'e girmez."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.readline().startswith(REPORT_MARK)
+    except OSError:
+        return False
+
+
+def render_day(md: str) -> tuple:
+    """Bir gunun markdown'i -> (istatistik, html, video sayisi). Ayni gun birden fazla calisma olabilir;
+    calismalar rapor basligina gore ayrilir ('---' ozet metninde de gecebilir, guvenilmez)."""
+    runs = [c for c in re.split(r"(?m)^(?=%s)" % re.escape(REPORT_MARK), md) if c.strip()]
+    stats, htmls = [], []
+    n_new = n_sum = 0
+    for chunk in runs:
+        body_lines = [l for l in chunk.splitlines() if not l.startswith(REPORT_MARK)]
+        for l in body_lines:
+            if l.startswith("**") and "içerik" in l:
+                s = re.sub(r"\.\s*Üretim:.*$", "", l).replace("**", "")
+                stats.append(s)
+                m_new, m_sum = re.search(r"(\d+) yeni içerik", s), re.search(r"(\d+) özet", s)
+                n_new += int(m_new.group(1)) if m_new else 0
+                n_sum += int(m_sum.group(1)) if m_sum else 0
+                break
+        body = "\n".join(l for l in body_lines if not (l.startswith("**") and "içerik" in l))
+        body = re.sub(r"\n-{3,}\s*$", "", body.rstrip())  # calisma ayraci <details> icine dusmesin
+        h = md_to_html(body).replace("<h2>Durum tablosu</h2>", '<details><summary>Durum tablosu</summary>', 1)
+        if "<details>" in h:
+            h += "</details>"  # her calismanin durum tablosu kendi katlanir blogunda
+        htmls.append(h)
+    stat = "%d yeni içerik, %d özet · %d çalışma" % (n_new, n_sum, len(runs)) if len(runs) > 1 else (stats[0] if stats else "")
+    html = "<hr>".join(htmls)
+    return stat, html, len(re.findall(r'<h3 class="vid">', html))
+
+
 def build_site(cfg: dict) -> Path:
     """Tum gunluk raporlari tek HTML sayfada toplar (en yeni ustte). Artifact olarak yayinlanmaya hazir."""
     rdir = report_dir(cfg)
-    files = sorted(rdir.glob("????-??-??.md"), reverse=True) if rdir.exists() else []
+    files = [f for f in rdir.glob("????-??-??*.md") if is_radar_report(f)] if rdir.exists() else []
     title = cfg.get("site_title") or "Niş Radar"
     chans = ", ".join(c["name"] for c in cfg.get("channels", []))
     nav, secs = [], []
+    days: dict = {}
     for f in files:
-        day = f.stem
-        md = f.read_text(encoding="utf-8", errors="replace")
-        # ilk satirdaki baslik ve ozet satirini ayikla
-        body_lines = [l for l in md.splitlines() if not l.startswith("# Niche Radar")]
-        stat = ""
-        for l in body_lines:
-            if l.startswith("**") and "içerik" in l:
-                stat = re.sub(r"\.\s*Üretim:.*$", "", l).replace("**", "")
-                break
-        body = "\n".join(l for l in body_lines if not (l.startswith("**") and "içerik" in l))
-        # durum tablosunu katlanir yap
-        body_html = md_to_html(body)
-        body_html = body_html.replace("<h2>Durum tablosu</h2>", '<details><summary>Durum tablosu</summary>')
-        if "<details>" in body_html:
-            body_html += "</details>"
-        n_vid = len(re.findall(r'<h3 class="vid">', body_html))
+        days.setdefault(f.name[:10], []).append(f)  # 2026-09-14.md ve 2026-09-14.nis-radar.md ayni gun
+    for day in sorted(days, reverse=True):
+        md = "\n\n".join(f.read_text(encoding="utf-8", errors="replace") for f in sorted(days[day]))
+        stat, body_html, n_vid = render_day(md)
         nav.append('<a href="#d%s">%s <span class="n">%d</span></a>' % (day, day, n_vid))
         secs.append('<section class="day" id="d%s"><h2 class="date">%s</h2><p class="stat">%s</p>%s</section>'
                     % (day, day, html_escape(stat), body_html))

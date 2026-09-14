@@ -415,5 +415,60 @@ class RetryAndPersistTests(RadarCase):
         self.assertEqual((state["backlog"], state["pending"], state["last_error"]), ([], [], None))
 
 
+class ReportFileAndSiteTests(RadarCase):
+    """P2-4 (yabanci .md dosyalarina dokunma) ve P3-5 (ayni gun birden fazla calisma sitede dogru)."""
+
+    def site(self) -> str:
+        return (self.home / "radar_site.html").read_text(encoding="utf-8")
+
+    def test_write_report_refuses_foreign_file(self):
+        radar.REPORTS.mkdir()
+        foreign = radar.REPORTS / ("%s.md" % TODAY.isoformat())
+        foreign.write_text("# Günlük not\nkişisel satır\n", encoding="utf-8")
+        self.run_once()
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "# Günlük not\nkişisel satır\n")
+        alt = radar.REPORTS / ("%s.nis-radar.md" % TODAY.isoformat())
+        self.assertTrue(alt.read_text(encoding="utf-8").startswith(radar.REPORT_MARK))
+        self.assertIn("dokunulmadi", self.log_text())
+        self.assertNotIn("kişisel", self.site())
+
+    def test_build_site_excludes_foreign_files(self):
+        radar.REPORTS.mkdir()
+        (radar.REPORTS / "2026-09-01.md").write_text("# Toplantı notu\nkişisel içerik\n", encoding="utf-8")
+        self.run_once()
+        html = self.site()
+        self.assertNotIn("kişisel", html)
+        self.assertEqual(html.count('<section class="day"'), 1)
+
+    def test_build_site_two_runs_same_day(self):
+        self.run_once()
+        self.run_once(discover=self.discover_n(4))  # sekme basina 1 yeni icerik daha
+        md = self.report_files()[0].read_text(encoding="utf-8")
+        self.assertEqual(md.count(radar.REPORT_MARK), 2)
+        html = self.site()
+        self.assertEqual(html.count("<details>"), 2)
+        self.assertEqual(html.count("</details>"), 2)
+        second_title = html.index("Baslik %s" % vid(0, "videos", 4))
+        self.assertGreater(second_title, html.index("</details>"))  # ikinci calisma ilk katlanir blogun disinda
+        self.assertIn('<span class="n">8</span>', html)
+        self.assertIn("8 yeni içerik, 8 özet · 2 çalışma", html)
+        self.assertNotIn("<details><hr>", html)
+
+    def test_build_site_single_run_unchanged(self):
+        self.run_once()
+        html = self.site()
+        self.assertEqual(html.count("<details>"), 1)
+        self.assertIn("4 yeni içerik, 4 özet</p>", html)
+        self.assertNotIn("çalışma", html)
+
+    def test_render_day_splits_on_header_not_hr(self):
+        run1 = "%s2026-09-14\n\n**1 yeni içerik**, 1 özet. Üretim: x\n\n## Videolar\n\n### [A](https://youtu.be/a)\n\nözet\n\n---\n\nsatır\n\n## Durum tablosu\n\n| Kanal | Video | Durum |\n|---|---|---|\n| K | A | altyazi |\n" % radar.REPORT_MARK
+        run2 = run1.replace("[A]", "[B]")
+        stat, html, n_vid = radar.render_day(run1 + "\n\n---\n\n" + run2)
+        self.assertEqual((n_vid, stat), (2, "2 yeni içerik, 2 özet · 2 çalışma"))
+        self.assertEqual(html.count("<details>"), 2)
+        self.assertEqual(html.count("<hr>"), 3)  # 2 ozet ici + 1 calisma ayraci; sondaki '---' kirpildi
+
+
 if __name__ == "__main__":
     unittest.main()
