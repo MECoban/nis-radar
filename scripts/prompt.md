@@ -18,7 +18,7 @@ Format (Markdown, başlıklar aynen kalsın):
 
 **Alıntı:** Transkriptten en vurucu 1 cümle, tırnak içinde, orijinal dilde.
 
-**İçerik fikri puanı:** X/10 — bu konuyu kendi kanalımda işlemeye değer mi, tek cümle gerekçe.
+**İçerik fikri puanı:** X/10 — benim nişim/işim: {niche}. Bu konuyu bu niş için kendi kanalımda işlemeye değer mi, tek cümle gerekçe.
 
 Transkript:
 {transcript}

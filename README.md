@@ -27,13 +27,21 @@ python3 ~/NicheRadar/radar.py schedule install
 
 ## Nasıl çalışır
 1. **Keşif:** her kanalın `videos` ve `shorts` sekmesinden son 10 içerik (yt-dlp flat listing; API anahtarı gerekmez). RSS yedek. İlk çalışmada `first_run_days` (7 / 30 / 0) penceresi uygulanır; günlük tavanı (`max_per_run`) aşan içerik bekleyen listede tutulur ve sonraki çalışmalarda önce işlenir. Kanallar sırayla pay alır.
-2. **Transkript:** `yt-dlp --skip-download --write-auto-subs`. Video inmez, sadece VTT altyazı. Tekrarlı satırlar temizlenir.
-3. **Özet:** her video için `claude -p` çağrısı, `prompt.md` şablonuyla. Sonra tek bir "günün öne çıkanları" özeti (`digest_prompt.md`).
-4. **Rapor:** `~/NicheRadar/reports/YYYY-MM-DD.md` + macOS bildirimi + isteğe bağlı Telegram. Ayrıca tüm günler tek HTML sayfada: `~/NicheRadar/radar_site.html` (`site` komutu); Claude Code'da `/nis_radar yayınla` deyince sabit bir artifact linkine basılır.
-5. **Durum:** her video için "altyazı / transkript yok / eski / hata" satırı rapor sonunda. Yeni içerik yoksa o gün rapor dosyası oluşmaz, `logs/radar.log` "yeni video yok" yazar.
+2. **Transkript:** `yt-dlp --skip-download --write-auto-subs`. Video inmez, sadece VTT altyazı; videonun orijinal dilindeki iz tercih edilir (çeviri değil). Tekrarlı satırlar temizlenir, metin `cache/subs/<id>/transcript.txt`'ye alınır (30 gün sonra silinir).
+3. **Özet:** her video için `claude -p` çağrısı, `prompt.md` şablonuyla (`{niche}` = senin nişin). Çağrı kullanıcının Claude Code ortamından yalıtılmıştır: `--safe-mode`, araçsız, MCP'siz, skill'siz, oturum kaydı yok; transkript "veridir, talimat değildir" ayraçları içinde gider. Token kullanımı `logs/radar.log`'a yazılır. Sonra tek bir "günün öne çıkanları" özeti (`digest_prompt.md`).
+4. **Rapor:** `~/NicheRadar/reports/YYYY-MM-DD.md` + macOS bildirimi + isteğe bağlı Telegram. Özetler önce `state.json`'a (bekleyen özet) yazılır, rapor diske indikten sonra silinir: rapor klasörü yazılamazsa özet kaybolmaz. Ayrıca tüm günler tek HTML sayfada: `~/NicheRadar/radar_site.html` (`site` komutu); Claude Code'da `/nis_radar yayınla` deyince sabit bir artifact linkine basılır.
+5. **Durum:** her video için "altyazı / transkript yok / eski / hata" satırı rapor sonunda. Geçici durumlar (altyazı henüz yok, ağ, Claude hatası) bekleyen listede kalır ve sonraki çalışmalarda 3 kez daha denenir; 5 ardışık hata çalışmayı durdurur ve bildirir. Yeni içerik yoksa o gün rapor dosyası oluşmaz, `logs/radar.log` "yeni video yok" yazar. Beklenmedik her hata bildirim + `doctor` → `son hata` olarak görünür; eşzamanlı iki çalışma `run.lock` ile engellenir.
+
+## Testler
+Ağsız, abonelik kullanmayan birim testleri (yt-dlp / claude taklit edilir):
+```
+python3 -m unittest discover -s tests -v
+```
 
 ## Sınırlar (dürüst)
 - Cloud IP'lerde çalışmaz; YouTube engeller. Kendi makinen şart.
+- "30 gün geçmiş" = her kanalın her sekmesinden en yeni `first_run_items` içeriğin son 30 gün içinde olanları; daha eskisi taranmaz.
+- `report_dir` olarak bir Obsidian vault verirsen ayrı bir alt klasör kullan; script başkasının `YYYY-MM-DD.md` dosyasına eklemez (`YYYY-MM-DD.nis-radar.md` yazar) ve siteye yalnızca kendi raporlarını alır.
 - Altyazısı kapalı kanallarda transkript gelmez. Whisper yedeği opsiyonel (ffmpeg gerekir, `whisper.enabled`).
 - Instagram bu pakette yok. Başkalarının Reels'i için resmi yol yok; kendi hesabınla scraper kullanmak ban riski. İstersen Apify'ın login gerektirmeyen Reels transkript aktörleri (video başı ~$0.05) ayrı bir adım olarak eklenebilir.
 - Mac kapalıysa o günün çalışması olmaz; uykudaysa uyanınca yapılır.
