@@ -131,4 +131,4 @@ Sınır (kullanıcıya söyle): sabah koşusu sayfayı kendisi basamaz (yayın a
 | yt-dlp bozuldu | YouTube değişikliği | `uv tool upgrade yt-dlp` |
 
 ## Paylaşım
-Bu klasörü olduğu gibi `~/.claude/skills/nis_radar/` (Windows: `%USERPROFILE%\.claude\skills\nis_radar\`) altına kopyalayan herkes Claude Code'da `/nis_radar` yazıp aynı kurulumu yapar.
+Repo klasörünü (`nis-radar-main`) Claude Code'da çalışma klasörü olarak açan herkes `/nis_radar` yazıp aynı kurulumu yapar; skill `.claude/skills/nis_radar/` altında olduğu için ek kopyalama gerekmez. Her klasörden erişmek isteyen `.claude/skills/nis_radar` klasörünü `~/.claude/skills/` (Windows: `%USERPROFILE%\.claude\skills\`) altına kopyalar. Aynı isimde iki kopya (proje + kullanıcı) varsa `/nis_radar` iki kez listelenir; birini kaldır.

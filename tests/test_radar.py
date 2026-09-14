@@ -19,7 +19,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+SKILL = ROOT / ".claude" / "skills" / "nis_radar"
+sys.path.insert(0, str(SKILL / "scripts"))
 import radar  # noqa: E402
 
 CHANNELS = [
@@ -55,7 +56,7 @@ class RadarCase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         for name in ("prompt.md", "digest_prompt.md"):
-            shutil.copy(ROOT / "scripts" / name, self.home / name)
+            shutil.copy(SKILL / "scripts" / name, self.home / name)
         self.notifications: list = []
         patches = [
             mock.patch.object(radar.time, "sleep", lambda *a, **k: None),
@@ -759,7 +760,7 @@ class ChannelSubsAndCacheTests(RadarCase):
         self.assertFalse(d.exists())
 
     def test_niche_placeholder_in_shipped_prompt(self):
-        self.assertIn("{niche}", (ROOT / "scripts" / "prompt.md").read_text(encoding="utf-8"))
+        self.assertIn("{niche}", (SKILL / "scripts" / "prompt.md").read_text(encoding="utf-8"))
         captured = {}
         item = {"id": "abcdefghijk", "tab": "videos", "title": "T", "channel": "K"}
         with mock.patch.object(radar, "ask_claude", side_effect=lambda c, p, timeout=420: captured.update(p=p) or "ok"):
