@@ -7,15 +7,18 @@ Takip ettiğin YouTube kanallarının (uzun video + Shorts) yeni içeriklerini h
 - Python 3.9+ (macOS'ta hazır)
 - `uv` (yt-dlp'yi kurmak için)
 
-## Kurulum (Claude Code ile, önerilen)
-1. Bu klasörü `~/.claude/skills/nis_radar/` altına kopyala (Windows: `%USERPROFILE%\.claude\skills\nis_radar\`).
-2. Claude Code'u aç, `/nis_radar` yaz. Claude bağımlılıkları kurar; kanallarını (ya da nişini) sorar, geçmişe kaç gün bakılacağını (7 / 30 / hiç) ve rapor saatini sorar, ilk raporu üretir, zamanlayıcıyı kurar. Sadece YouTube (video + Shorts).
+## Kurulum (Claude uygulaması ile, önerilen — terminal gerekmez)
+1. GitHub'da **Code → Download ZIP** → İndirilenler'e iner; çift tıkla → `nis-radar-main` klasörü.
+2. Claude uygulaması → **Code** sekmesi → yeni oturum → çalışma klasörü olarak `nis-radar-main`'i seç.
+3. Sohbet kutusuna `/nis_radar` yaz → Enter. Claude bağımlılıkları kurar; kanallarını (ya da nişini), geçmişe kaç gün bakılacağını (7 / 30 / hiç), rapor saatini ve nişini sorar, ilk raporu üretir, zamanlayıcıyı kurar. Sadece YouTube (video + Shorts).
 
-## Kurulum (elle)
+Skill klasörün içinde `.claude/skills/nis_radar/` altında durur; Claude Code klasörü açınca onu otomatik görür. Kurulum her şeyi `~/NicheRadar/` altına kopyalar, sonrasında indirdiğin klasör silinebilir. Kalıcı olarak her klasörden erişmek istersen `.claude/skills/nis_radar` klasörünü `~/.claude/skills/` altına kopyala (Windows: `%USERPROFILE%\.claude\skills\`).
+
+## Kurulum (elle, terminalden)
 Windows'ta (Git Bash) `python3` yerine `python`; `~/NicheRadar` yolu aynen çalışır.
 ```
 uv tool install "yt-dlp[default,curl-cffi]"
-python3 scripts/radar.py install
+python3 .claude/skills/nis_radar/scripts/radar.py install
 python3 ~/NicheRadar/radar.py add-channel @nicksaraev https://www.youtube.com/@NateHerk   # handle, kanal veya video linki
 python3 ~/NicheRadar/radar.py check-channel @aday        # eklemeden dogrula
 python3 ~/NicheRadar/radar.py remove-channel @nicksaraev
