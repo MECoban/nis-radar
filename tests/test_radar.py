@@ -399,6 +399,17 @@ class RetryAndPersistTests(RadarCase):
         self.assertIn("Rapor klasoru yazilamiyor", str(ctx.exception))
         self.assertEqual(set(self.read_state()), {"last_error"})  # seen/backlog'a dokunulmadi, sadece hata kaydi
 
+    def test_dry_run_warns_but_continues_on_unwritable_report_dir(self):
+        """Codex P2: dry-run rapor yazmaz; yazilamayan report_dir onu durdurmamali, sadece uyarmali."""
+        blocker = self.home / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        self.write_config(report_dir=str(blocker / "reports"))
+        calls = self.run_once(dry_run=True)
+        self.assertGreater(calls.discover.call_count, 0)
+        self.assertIn("uyari (dry-run rapor yazmaz", self.log_text())
+        self.assertIn("dry-run bitti", self.log_text())
+        self.assertFalse(radar.STATE.exists())
+
     def test_only_preserves_other_backlog(self):
         nate = {"id": "NATE0000001", "title": "n", "tab": "videos", "channel": CHANNELS[0]["name"],
                 "channel_id": CHANNELS[0]["id"], "age_days": 14, "cutoff": (TODAY - dt.timedelta(days=14)).isoformat(), "attempts": 2}

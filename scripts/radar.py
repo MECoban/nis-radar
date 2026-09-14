@@ -935,7 +935,13 @@ def cmd_run(args) -> None:
 def _run(cfg: dict, args) -> None:
     if not cfg["channels"]:
         raise SystemExit("Kanal yok. Once: radar.py add-channel @handle")
-    check_report_dir_writable(report_dir(cfg))
+    if args.dry_run:
+        try:
+            check_report_dir_writable(report_dir(cfg))
+        except SystemExit as e:
+            log("  ! uyari (dry-run rapor yazmaz, devam ediyor): %s" % e)  # kesif yine gosterilsin, ama sorun gorunsun
+    else:
+        check_report_dir_writable(report_dir(cfg))
     state = load_state(cfg)
     seen: dict = state["seen"]
     backlog: list = state["backlog"]
