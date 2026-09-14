@@ -98,7 +98,10 @@ def now() -> str:
 
 def log(msg: str) -> None:
     line = "[%s] %s" % (now(), msg)
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError):
+        pass  # stdout kapali/kirik boru (ornek: `run | grep` erken bitti): calisma ve kilit bundan etkilenmesin
     try:
         LOGS.mkdir(parents=True, exist_ok=True)
         with open(LOGS / "radar.log", "a", encoding="utf-8") as f:

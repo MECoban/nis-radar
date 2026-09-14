@@ -612,6 +612,16 @@ class LockErrorsAndBaselineTests(RadarCase):
         self.assertFalse(radar.STATE.exists())
         self.assertFalse(radar.LOCK.exists())
 
+    def test_log_survives_broken_stdout(self):
+        """Canli bulgu: `run | grep` erken bitince print BrokenPipeError firlatiyor, kosu oluyor ve kilit kaliyordu."""
+        def broken_print(*a, **k):
+            raise BrokenPipeError(32, "Broken pipe")
+        with mock.patch.object(radar, "print", broken_print, create=True):
+            self.run_once()
+        self.assertFalse(radar.LOCK.exists())
+        self.assertIn("=== run bitti", self.log_text())
+        self.assertEqual(len(self.report_files()), 1)
+
 
 class ChannelSubsAndCacheTests(RadarCase):
     """P3-6 (remove-channel), P3-12 (orijinal dil altyazisi), P3-13 (eski URL'ler, onbellek, nis)."""
