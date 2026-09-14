@@ -762,7 +762,7 @@ def cmd_doctor(args) -> None:
             print("             ! kesif bos dondu. Ag/VPN/bot kontrolu olabilir; logs/radar.log'a bak")
     state = load_json(STATE, {})
     print("  son calisma:", state.get("last_run", "hic"))
-    reps = sorted(report_dir(cfg).glob("*.md")) if report_dir(cfg).exists() else []
+    reps = sorted(report_dir(cfg).glob("*.md")) if report_dir(cfg).is_dir() else []
     print("  son rapor:", reps[-1].name if reps else "yok")
     print("  zamanlayici:", schedule_status_text())
     print("SONUC:", "hazir" if ok else "eksik var")
@@ -952,9 +952,17 @@ def _run(cfg: dict, args) -> None:
     def selected(name: str, handle: str = "") -> bool:
         return not only or only in (name or "").lower() or only in (handle or "").lower()
 
+    by_id = {c["id"]: c for c in cfg["channels"]}
+    by_name = {c["name"]: c for c in cfg["channels"]}
+
+    def selected_item(i: dict) -> bool:
+        # bekleyen ogelerde handle yok: --only @handle icin kanali config'den bul (eski ogelerde sadece ad var)
+        ch = by_id.get(i.get("channel_id")) or by_name.get(i.get("channel")) or {}
+        return selected(ch.get("name") or i.get("channel", ""), ch.get("handle", ""))
+
     lists: list = []  # kanal/sekme basina listeler; sonra round-robin birlestirilir
-    others = [i for i in backlog if not selected(i.get("channel", ""))]  # --only disinda kalanlar korunur
-    mine = [i for i in backlog if selected(i.get("channel", ""))]
+    others = [i for i in backlog if not selected_item(i)]  # --only disinda kalanlar korunur
+    mine = [i for i in backlog if selected_item(i)]
     if mine:
         groups: dict = {}
         for i in mine:
@@ -1344,8 +1352,10 @@ def render_day(md: str) -> tuple:
 
 def build_site(cfg: dict) -> Path:
     """Tum gunluk raporlari tek HTML sayfada toplar (en yeni ustte). Artifact olarak yayinlanmaya hazir."""
-    rdir = report_dir(cfg)
-    files = [f for f in rdir.glob("????-??-??*.md") if is_radar_report(f)] if rdir.exists() else []
+    dirs = [report_dir(cfg)]
+    if REPORTS not in dirs:
+        dirs.append(REPORTS)  # ozel report_dir yazilamayinca yedek olarak buraya dusen raporlar da sayfaya girsin
+    files = [f for d in dirs if d.is_dir() for f in d.glob("????-??-??*.md") if is_radar_report(f)]
     title = cfg.get("site_title") or "Niş Radar"
     chans = ", ".join(c["name"] for c in cfg.get("channels", []))
     nav, secs = [], []

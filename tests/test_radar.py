@@ -371,6 +371,22 @@ class RetryAndPersistTests(RadarCase):
         self.assertEqual(len(self.report_files()), 1)  # REPORTS altina yedek yazim
         self.assertEqual(self.read_state()["pending"], [])
         self.assertTrue(any("yedek klasore" in body for _, body in self.notifications))
+        html = (self.home / "radar_site.html").read_text(encoding="utf-8")  # Codex P2: sayfa yedek raporu da gormeli
+        self.assertIn("Baslik %s" % vid(0, "videos", 1), html)
+        self.assertIn("sayfa:", self.log_text())
+
+    def test_only_by_handle_processes_own_backlog(self):
+        """Codex P2: bekleyen ogelerde handle yok; --only @handle yine de o kanalin bekleyenini islemeli."""
+        nate = {"id": "NATE0000001", "title": "n", "tab": "videos", "channel": CHANNELS[0]["name"],
+                "channel_id": CHANNELS[0]["id"], "age_days": 14, "cutoff": (TODAY - dt.timedelta(days=14)).isoformat(), "attempts": 0}
+        matt = dict(nate, id="MATT0000001", channel=CHANNELS[1]["name"], channel_id=CHANNELS[1]["id"])
+        legacy = {"id": "LEGACY00001", "title": "l", "tab": "videos", "channel": CHANNELS[1]["name"], "age_days": 14}  # eski surum: channel_id yok
+        self.write_state({"seen": {}, "initialized": True, "backlog": [nate, matt, legacy]})
+        self.run_once(discover=lambda ch, tab, n: [], only="@mreflow")
+        state = self.read_state()
+        self.assertIn("MATT0000001", state["seen"])
+        self.assertIn("LEGACY00001", state["seen"])
+        self.assertEqual([b["id"] for b in state["backlog"]], ["NATE0000001"])
 
     def test_preflight_unwritable_report_dir(self):
         blocker = self.home / "blocker"
