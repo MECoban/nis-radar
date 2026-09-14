@@ -1,0 +1,26 @@
+{
+  "channels": [],
+  "tabs": ["videos", "shorts"],
+  "discover_items": 10,
+  "first_run_items": 10,
+  "first_run_days": 7,
+  "max_per_run": 20,
+  "max_age_days": 14,
+  "sub_langs": ["en", "tr"],
+  "summary_lang": "Türkçe",
+  "model": "sonnet",
+  "digest": true,
+  "max_transcript_chars": 60000,
+  "sleep_seconds": 2,
+  "report_dir": "",
+  "site_title": "Niş Radar",
+  "artifact_url": "",
+  "schedule_time": "08:00",
+  "notify_macos": true,
+  "telegram": { "bot_token": "", "chat_id": "" },
+  "ytdlp_extra_args": [],
+  "whisper": {
+    "enabled": false,
+    "command": "whisper {audio} --model base --output_format txt --output_dir {outdir}"
+  }
+}
