@@ -597,5 +597,136 @@ class LockErrorsAndBaselineTests(RadarCase):
         self.assertFalse(radar.LOCK.exists())
 
 
+class ChannelSubsAndCacheTests(RadarCase):
+    """P3-6 (remove-channel), P3-12 (orijinal dil altyazisi), P3-13 (eski URL'ler, onbellek, nis)."""
+
+    def remove(self, *raw):
+        radar.cmd_remove(SimpleNamespace(channel=list(raw)))
+
+    def names(self) -> list:
+        return [c["name"] for c in radar.load_config()["channels"]]
+
+    def test_remove_exact_handle_url_id(self):
+        self.write_config(channels=[dict(c) for c in CHANNELS] + [dict(THIRD)])
+        self.remove("@mreflow")
+        self.assertEqual(self.names(), [CHANNELS[0]["name"], THIRD["name"]])
+        self.remove("https://www.youtube.com/@nateherk/videos")
+        self.assertEqual(self.names(), [THIRD["name"]])
+        self.remove(THIRD["id"])
+        self.assertEqual(self.names(), [])
+        self.assertFalse(radar.LOCK.exists())
+
+    def test_remove_ambiguous_substring_aborts(self):
+        self.write_config(channels=[dict(c) for c in CHANNELS] + [dict(THIRD)])
+        with self.assertRaises(SystemExit):
+            self.remove("a")  # uc kanalin adinda da gecer
+        self.assertEqual(len(self.names()), 3)
+        self.assertIn("birden fazla eslesme", self.log_text())
+        with self.assertRaises(SystemExit):
+            self.remove("ai")  # "AI Automation" ve "AI Explained"
+        self.assertEqual(len(self.names()), 3)
+
+    def test_remove_unique_substring_and_missing(self):
+        self.remove("wolfe")
+        self.assertEqual(self.names(), [CHANNELS[0]["name"]])
+        with self.assertRaises(SystemExit):
+            self.remove("yok boyle kanal")
+        self.assertEqual(self.names(), [CHANNELS[0]["name"]])
+
+    def test_remove_purges_backlog_and_pending(self):
+        self.run_once(fetch=fetch_fail)  # 4 icerik backlog'da
+        st = self.read_state()
+        st["pending"] = [{"item": {"id": "PEND0000001", "channel": CHANNELS[1]["name"], "channel_id": CHANNELS[1]["id"], "tab": "videos", "title": "p"},
+                          "meta": {}, "status": "altyazi", "summary": "s", "chars": 10, "ok": True}]
+        st["backlog"].append({"id": "LEGACY00001", "title": "l", "tab": "videos", "channel": CHANNELS[1]["name"]})  # eski surum: channel_id yok
+        self.write_state(st)
+        self.remove("@mreflow")
+        st = self.read_state()
+        self.assertTrue(all(b["channel"] == CHANNELS[0]["name"] for b in st["backlog"]))
+        self.assertEqual(len(st["backlog"]), 2)
+        self.assertEqual(st["pending"], [])
+        self.assertEqual(list(st["baselined"]), [CHANNELS[0]["id"]])
+        self.assertIn("bekleyen listeden 4 icerik temizlendi", self.log_text())
+
+    def test_remove_is_blocked_by_lock(self):
+        radar.LOCK.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            self.remove("@mreflow")
+        self.assertEqual(len(self.names()), 2)
+        self.assertTrue(radar.LOCK.exists())
+
+    def test_pick_vtt_prefers_original_language(self):
+        cases = [
+            (["X.en.vtt", "X.tr-orig.vtt", "X.tr.vtt"], "X.tr.vtt"),   # Turkce video: ceviri (en) degil, orijinal
+            (["X.en.vtt", "X.tr-orig.vtt"], "X.tr-orig.vtt"),
+            (["X.en-orig.vtt", "X.en.vtt", "X.tr.vtt"], "X.en.vtt"),   # Ingilizce video (canli onbellekteki durum)
+            (["X.en-orig.vtt"], "X.en-orig.vtt"),
+            (["X.tr.vtt", "X.en.vtt"], "X.en.vtt"),                     # -orig yok: sub_langs sirasi
+            (["X.de.vtt"], "X.de.vtt"),
+        ]
+        for files, expected in cases:
+            with self.subTest(files=files):
+                d = self.home / ("vtt-%d" % abs(hash(tuple(files))))
+                d.mkdir()
+                for n in files:
+                    (d / n).write_text("WEBVTT", encoding="utf-8")
+                self.assertEqual(radar.pick_vtt(d, ["en", "tr"]).name, expected)
+        self.assertIsNone(radar.pick_vtt(self.home / "bos", ["en"]))
+
+    def test_resolve_legacy_urls(self):
+        seen_urls = []
+
+        def fake_run(cmd, timeout=120, stdin=None, cwd=None):
+            seen_urls.append(cmd[-1])
+            return completed("UCNJ1Ymd5yFuUPtn21xtRbbw\tAd\t@h\n")
+        cases = {
+            "https://www.youtube.com/c/SomeChannel": "https://www.youtube.com/c/SomeChannel/videos",
+            "https://www.youtube.com/user/GoogleDevelopers/videos": "https://www.youtube.com/user/GoogleDevelopers/videos",
+            "@handle": "https://www.youtube.com/@handle/videos",
+            "https://www.youtube.com/@x?si=abc": "https://www.youtube.com/@x/videos",
+            "UCNJ1Ymd5yFuUPtn21xtRbbw": "https://www.youtube.com/channel/UCNJ1Ymd5yFuUPtn21xtRbbw/videos",
+        }
+        with mock.patch.object(radar, "run", side_effect=fake_run):
+            for raw, url in cases.items():
+                with self.subTest(raw=raw):
+                    ch = radar.resolve_channel(raw)
+                    self.assertEqual(seen_urls[-1], url)
+                    self.assertEqual(ch, {"name": "Ad", "id": "UCNJ1Ymd5yFuUPtn21xtRbbw", "handle": "@h"})
+
+    def test_prune_cache(self):
+        subs = radar.CACHE / "subs"
+        old_ts = time.time() - 40 * 86400
+        for name in ("OLDGONE0001", "OLDKEEP0001", "RECENT00001"):
+            d = subs / name
+            d.mkdir(parents=True)
+            (d / "meta.txt").write_text("x", encoding="utf-8")
+        for name in ("OLDGONE0001", "OLDKEEP0001"):
+            os.utime(subs / name, (old_ts, old_ts))
+        state = {"backlog": [{"id": "OLDKEEP0001"}], "pending": []}
+        self.assertEqual(radar.prune_cache(state, radar.load_config()), 1)
+        self.assertEqual(sorted(p.name for p in subs.iterdir()), ["OLDKEEP0001", "RECENT00001"])
+        self.assertIn("onbellek temizlendi: 1 klasor", self.log_text())
+
+    def test_run_prunes_old_cache(self):
+        d = radar.CACHE / "subs" / "ANCIENT0001"
+        d.mkdir(parents=True)
+        old_ts = time.time() - 40 * 86400
+        os.utime(d, (old_ts, old_ts))
+        self.run_once()
+        self.assertFalse(d.exists())
+
+    def test_niche_placeholder_in_shipped_prompt(self):
+        self.assertIn("{niche}", (ROOT / "scripts" / "prompt.md").read_text(encoding="utf-8"))
+        captured = {}
+        item = {"id": "abcdefghijk", "tab": "videos", "title": "T", "channel": "K"}
+        with mock.patch.object(radar, "ask_claude", side_effect=lambda c, p, timeout=420: captured.update(p=p) or "ok"):
+            radar.summarize(radar.load_config(), item, meta_for("abcdefghijk"), "metin")
+            self.assertIn("nişim/işim: belirtilmedi", captured["p"])
+            cfg = radar.load_config()
+            cfg["niche"] = "KOBİ için n8n"
+            radar.summarize(cfg, item, meta_for("abcdefghijk"), "metin")
+            self.assertIn("nişim/işim: KOBİ için n8n", captured["p"])
+
+
 if __name__ == "__main__":
     unittest.main()

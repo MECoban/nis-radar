@@ -68,6 +68,8 @@ DEFAULT_CONFIG = {
     "max_attempts": 3,
     "max_consecutive_failures": 5,
     "lock_stale_hours": 3,
+    "cache_keep_days": 30,
+    "niche": "",
     "sub_langs": ["en", "tr"],
     "summary_lang": "Türkçe",
     "model": "sonnet",
@@ -217,8 +219,11 @@ def resolve_channel(raw: str) -> dict:
             raise SystemExit("Video linkinden kanal cozulemedi: %s\n%s" % (raw, r.stderr.strip()[-300:]))
         raw = cid
     m = re.search(r"(UC[A-Za-z0-9_-]{22})", raw)
+    ml = re.search(r"youtube\.com/(c|user)/([^/?#]+)", raw)
     if m and (raw.startswith("UC") or "/channel/" in raw):
         url = "https://www.youtube.com/channel/%s/videos" % m.group(1)
+    elif ml:  # eski tip /c/AD ve /user/AD adresleri: yt-dlp kendisi cozer
+        url = "https://www.youtube.com/%s/%s/videos" % (ml.group(1), ml.group(2))
     else:
         handle = raw
         mh = re.search(r"youtube\.com/@([^/?#]+)", raw)
@@ -297,16 +302,29 @@ def parse_vtt(path: Path) -> str:
     return " ".join(lines)
 
 
+def _vtt_lang(f: Path) -> str:
+    parts = f.name.split(".")
+    return parts[-2] if len(parts) >= 3 else ""
+
+
 def pick_vtt(folder: Path, langs: list) -> Path | None:
+    """Videonun ORIJINAL dilindeki altyaziyi sec; ceviri her zaman daha kotudur ve Claude her dili okur.
+
+    yt-dlp orijinal otomatik altyaziyi '<dil>-orig' diye adlandirir (ornek: Turkce videoda tr-orig, tr, en).
+    Sira: orijinal dilin id.<dil>.vtt'si (manuel altyazi varsa odur) -> id.<dil>-orig.vtt -> sub_langs sirasi -> ilk dosya.
+    """
     files = sorted(folder.glob("*.vtt"))
     if not files:
         return None
+    by_lang = {_vtt_lang(f): f for f in files}
+    orig_langs = [l[:-5] for l in by_lang if l.endswith("-orig")]
+    for lang in orig_langs:
+        if lang in by_lang:
+            return by_lang[lang]
+        return by_lang[lang + "-orig"]
     for lang in langs:
-        for f in files:
-            # id.en.vtt tercih, id.en-orig.vtt ikinci
-            parts = f.name.split(".")
-            if len(parts) >= 3 and parts[-2] == lang:
-                return f
+        if lang in by_lang:
+            return by_lang[lang]
         for f in files:
             if (".%s" % lang) in f.name:
                 return f
@@ -604,21 +622,68 @@ def cmd_check(args) -> None:
         raise SystemExit(1)
 
 
+def _channel_key(raw: str) -> tuple:
+    """Girdi -> (tur, anahtar): UC id, @handle / kanal URL'i ya da serbest metin. Aga cikilmaz."""
+    s = raw.strip()
+    m = re.search(r"(UC[A-Za-z0-9_-]{22})", s)
+    if m and (s.startswith("UC") or "/channel/" in s):
+        return "id", m.group(1).lower()
+    mh = re.search(r"youtube\.com/@([^/?#]+)", s)
+    if mh:
+        return "handle", mh.group(1).lower()
+    if s.startswith("@"):
+        return "handle", s[1:].lower()
+    return "text", s.lower()
+
+
 def cmd_remove(args) -> None:
-    cfg_raw = load_json(CONFIG, DEFAULT_CONFIG)
-    chans = cfg_raw.get("channels", [])
-    for raw in args.channel:
-        key = raw.strip().lstrip("@").lower()
-        hit = [c for c in chans if key in (c["id"].lower(), c.get("handle", "").lstrip("@").lower(), c["name"].lower())
-               or key in c["name"].lower()]
-        if not hit:
-            log("bulunamadi: %s" % raw)
-            continue
-        for c in hit:
-            chans.remove(c)
-            log("cikarildi: %s (%s)" % (c["name"], c["id"]))
-    cfg_raw["channels"] = chans
-    save_json(CONFIG, cfg_raw)
+    """Tam eslesme (id / handle / ad) ya da TEK kanala denk gelen alt-dize; belirsizse hicbir sey silinmez."""
+    cfg = load_config()
+    if not acquire_lock(cfg):
+        raise SystemExit("Bir calisma suruyor (run.lock); bitince tekrar dene.")
+    try:
+        cfg_raw = load_json(CONFIG, DEFAULT_CONFIG)
+        chans = cfg_raw.get("channels", [])
+        removed, bad = [], 0
+        for raw in args.channel:
+            kind, key = _channel_key(raw)
+            hit = [c for c in chans if key in (c["id"].lower(), c.get("handle", "").lstrip("@").lower(), c["name"].lower())]
+            if kind == "text" and not hit:
+                hit = [c for c in chans if key in c["name"].lower() or key in c.get("handle", "").lstrip("@").lower()]
+            if not hit:
+                log("bulunamadi: %s" % raw)
+                bad += 1
+                continue
+            if len(hit) > 1:
+                log("birden fazla eslesme, hicbiri silinmedi: %s -> %s (tam ad, @handle ya da id ver)" % (
+                    raw, ", ".join("%s (%s)" % (c["name"], c.get("handle") or c["id"]) for c in hit)))
+                bad += 1
+                continue
+            chans.remove(hit[0])
+            removed.append(hit[0])
+            log("cikarildi: %s (%s)" % (hit[0]["name"], hit[0]["id"]))
+        cfg_raw["channels"] = chans
+        save_json(CONFIG, cfg_raw)
+        if removed and STATE.exists():
+            st = load_json(STATE, {})
+            ids = {c["id"] for c in removed}
+            names = {c["name"] for c in removed}
+
+            def keep(i: dict) -> bool:
+                return i.get("channel_id") not in ids and (bool(i.get("channel_id")) or i.get("channel") not in names)
+            before = len(st.get("backlog") or []) + len(st.get("pending") or [])
+            st["backlog"] = [i for i in st.get("backlog") or [] if keep(i)]
+            st["pending"] = [p for p in st.get("pending") or [] if keep(p.get("item") or {})]
+            for cid in ids:
+                (st.get("baselined") or {}).pop(cid, None)
+            save_json(STATE, st)
+            gone = before - len(st["backlog"]) - len(st["pending"])
+            if gone:
+                log("bekleyen listeden %d icerik temizlendi" % gone)
+        if bad:
+            raise SystemExit(1)
+    finally:
+        release_lock()
 
 
 def cmd_list(args) -> None:
@@ -666,6 +731,12 @@ def cmd_doctor(args) -> None:
         except ClaudeError as e:
             ok = False
             print("  claude -p : HATA %s" % e)
+    if cfg.get("niche"):
+        try:
+            if "{niche}" not in read_prompt("prompt.md"):
+                print("  prompt   : ! config'de niche var ama kurulu prompt.md'de {niche} yok -> scripts/prompt.md'yi %s'e kopyala" % (HOME / "prompt.md"))
+        except SystemExit:
+            pass
     if not re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(cfg.get("schedule_time", "")).strip()):
         ok = False
         print("  saat     : GECERSIZ %r (beklenen HH:MM, ornek 08:00)" % cfg.get("schedule_time"))
@@ -733,6 +804,30 @@ def persist(state: dict, others: list, retry: list, remaining: list) -> None:
     """Bekleyen liste = bu calismaya girmeyenler (--only) + tekrar denenecekler + henuz islenmeyenler."""
     state["backlog"] = [_slim(x) for x in others] + [_slim(x) for x in retry] + [_slim(x) for x in remaining]
     save_json(STATE, state)
+
+
+def prune_cache(state: dict, cfg: dict) -> int:
+    """cache/subs/<id> klasorlerinden eski olanlari sil; bekleyen/tekrar denenecek icerigin onbellegi korunur."""
+    keep_days = int(cfg.get("cache_keep_days") or 30)
+    subs = CACHE / "subs"
+    if not subs.exists():
+        return 0
+    protected = {i.get("id") for i in state.get("backlog") or []}
+    protected |= {(p.get("item") or {}).get("id") for p in state.get("pending") or []}
+    limit = time.time() - keep_days * 86400
+    n = 0
+    for d in subs.iterdir():
+        if not d.is_dir() or d.name in protected:
+            continue
+        try:
+            if d.stat().st_mtime < limit:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1
+        except OSError:
+            pass
+    if n:
+        log("onbellek temizlendi: %d klasor (%d gunden eski)" % (n, keep_days))
+    return n
 
 
 def check_report_dir_writable(rdir: Path) -> None:
@@ -1024,6 +1119,7 @@ def _run(cfg: dict, args) -> None:
         log("sayfa: %s" % build_site(cfg))
     except Exception as e:  # noqa: BLE001
         log("  ! sayfa uretilemedi: %s" % e)
+    prune_cache(state, cfg)
     n_ok = sum(1 for r in pending if r["ok"])
     n_in = sum(1 for r in pending if not r["status"].startswith("eski"))
     notify(cfg, "Niche Radar", "%d yeni icerik, %d ozet hazir. %s" % (n_in, n_ok, path.name))
