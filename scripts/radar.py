@@ -1235,7 +1235,8 @@ def md_to_html(md: str) -> str:
     def flush_table():
         if table:
             rows = [r for r in table if not re.fullmatch(r"\|[\s|:-]+\|", r.strip())]
-            cells = [[c.strip() for c in r.strip().strip("|").split("|")] for r in rows]
+            # hucre icindeki kacisli \| (ornek: "Nate Herk \| AI Automation") sutun ayraci degildir
+            cells = [[c.strip().replace("\x00", "|") for c in r.strip().strip("|").replace("\\|", "\x00").split("|")] for r in rows]
             if cells:
                 head = "".join("<th>%s</th>" % _md_inline(c) for c in cells[0])
                 body = "".join("<tr>%s</tr>" % "".join("<td>%s</td>" % _md_inline(c) for c in r) for r in cells[1:])
